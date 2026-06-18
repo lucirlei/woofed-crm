@@ -1,0 +1,222 @@
+version: "3.7"
+
+# ==============================================================================
+# Woofed CRM - Portainer stack
+# ------------------------------------------------------------------------------
+# Image:   douglara/woofedcrm:latest  (Rails app, Sidekiq and GoodJob workers)
+# Network: public_network (external)
+#
+# The AI agent (agno / AgentOS) is NOT part of the douglara/woofedcrm image, so
+# it is built from this repository's Dockerfile.ai_agent. If you deploy this
+# stack from a Git repository in Portainer, the build context resolves to the
+# repo root automatically.
+#
+# Before deploying:
+#   1. Create the external network (once):
+#        docker network create --driver overlay --attachable public_network
+#        (standalone / non-Swarm: docker network create public_network — and
+#         remove the deploy: blocks below, they are ignored outside Swarm)
+#   2. Set these environment variables in the Portainer stack UI:
+#        SECRET_KEY_BASE   -> openssl rand -hex 64
+#        OS_SECURITY_KEY   -> openssl rand -hex 32  (shared by app + AI agent)
+#        POSTGRES_PASSWORD -> a strong password
+#        FRONTEND_URL      -> your public URL, e.g. https://crm.seudominio.com
+# ==============================================================================
+
+services:
+  # ----------------------------------------------------------------------------
+  # PostgreSQL with pgvector (required — the app uses vector embeddings for AI)
+  # ----------------------------------------------------------------------------
+  woofedcrm_postgres:
+    image: pgvector/pgvector:pg16
+    volumes:
+      - woofedcrm_pg_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-please-change-this-password}
+      POSTGRES_DB: woofed_crm_production
+    networks:
+      - public_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1024M
+
+  # ----------------------------------------------------------------------------
+  # Redis (used by Sidekiq / ActionCable / cache)
+  # ----------------------------------------------------------------------------
+  woofedcrm_redis:
+    image: redis:6.2.7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - woofedcrm_redis_data:/data
+    networks:
+      - public_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # ----------------------------------------------------------------------------
+  # Woofed CRM - Web application (Rails / Puma)
+  # ----------------------------------------------------------------------------
+  woofedcrm_web:
+    image: douglara/woofedcrm:latest
+    command: >
+      bash -c "bundle exec rails db:create db:migrate db:seed --trace &&
+               bundle exec puma -C config/puma.rb"
+    depends_on:
+      - woofedcrm_postgres
+      - woofedcrm_redis
+    environment:
+      RAILS_ENV: production
+      RAILS_SERVE_STATIC_FILES: "true"
+      RAILS_LOG_TO_STDOUT: "true"
+      PORT: "80"
+      # ---- Required secrets (CHANGE THESE) -----------------------------------
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:-please-change-this-to-a-long-random-string}
+      # ---- Database / Redis --------------------------------------------------
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-please-change-this-password}@woofedcrm_postgres:5432/woofed_crm_production
+      REDIS_URL: redis://woofedcrm_redis:6379/0
+      GOOD_JOB_EXECUTION_MODE: external
+      # ---- AI agent integration ----------------------------------------------
+      # OS_SECURITY_KEY is the shared bearer token between Rails and the agent.
+      OS_SECURITY_KEY: ${OS_SECURITY_KEY:-please-change-me-to-a-long-random-secret}
+      WOOFED_AI_URL: http://woofedcrm_ai_agent:7777
+      # ---- Application config -------------------------------------------------
+      LANGUAGE: pt-BR
+      DEFAULT_TIMEZONE: Brasilia
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+      ENABLE_USER_SIGNUP: "false"
+      STORE_URL: https://store.woofedcrm.com
+      # ---- Admin (Motor Admin) -----------------------------------------------
+      MOTOR_AUTH_USERNAME: ${MOTOR_AUTH_USERNAME:-lovewoofed}
+      MOTOR_AUTH_PASSWORD: ${MOTOR_AUTH_PASSWORD:-lovewoofed}
+      # ---- Web Push (VAPID) — generate your own keys for production ----------
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-BLw6I51TymLSBO12u6Hpo3ZV_i1NF6cCaEdmeY2xCBSIA14OIQ8FnXqoF44prooqxoz_T8YNSuUs_JWzmv35BRo=}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-KSShgYVLEG5azO4uKt-APWHBZifQtwnmfTSm8rvYpQ8=}
+      # ---- Optional integrations (uncomment / fill as needed) ----------------
+      # OPENAI_API_KEY: ${OPENAI_API_KEY}
+      # EVOLUTION_API_ENDPOINT: ${EVOLUTION_API_ENDPOINT}
+      # EVOLUTION_API_ENDPOINT_TOKEN: ${EVOLUTION_API_ENDPOINT_TOKEN}
+      # SMTP_ADDRESS: smtp.example.com
+      # SMTP_PORT: "587"
+      # SMTP_USERNAME: your_username
+      # SMTP_PASSWORD: your_password
+      # MAILER_SENDER_EMAIL: WoofedCRM <hi@woofedcrm.com>
+    networks:
+      - public_network
+    ports:
+      - "3000:80"
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1024M
+
+  # ----------------------------------------------------------------------------
+  # Woofed CRM - Sidekiq worker (short async jobs)
+  # ----------------------------------------------------------------------------
+  woofedcrm_sidekiq:
+    image: douglara/woofedcrm:latest
+    command: bundle exec sidekiq -C config/sidekiq.yml
+    depends_on:
+      - woofedcrm_postgres
+      - woofedcrm_redis
+      - woofedcrm_web
+    environment:
+      RAILS_ENV: production
+      RAILS_LOG_TO_STDOUT: "true"
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:-please-change-this-to-a-long-random-string}
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-please-change-this-password}@woofedcrm_postgres:5432/woofed_crm_production
+      REDIS_URL: redis://woofedcrm_redis:6379/0
+      LANGUAGE: pt-BR
+      DEFAULT_TIMEZONE: Brasilia
+    networks:
+      - public_network
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  # ----------------------------------------------------------------------------
+  # Woofed CRM - GoodJob worker (long-running / scheduled jobs)
+  # ----------------------------------------------------------------------------
+  woofedcrm_goodjob:
+    image: douglara/woofedcrm:latest
+    command: bundle exec good_job
+    depends_on:
+      - woofedcrm_postgres
+      - woofedcrm_redis
+      - woofedcrm_web
+    environment:
+      RAILS_ENV: production
+      RAILS_LOG_TO_STDOUT: "true"
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:-please-change-this-to-a-long-random-string}
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-please-change-this-password}@woofedcrm_postgres:5432/woofed_crm_production
+      REDIS_URL: redis://woofedcrm_redis:6379/0
+      GOOD_JOB_EXECUTION_MODE: external
+      LANGUAGE: pt-BR
+      DEFAULT_TIMEZONE: Brasilia
+    networks:
+      - public_network
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  # ----------------------------------------------------------------------------
+  # Woofed CRM - AI agent (agno / AgentOS, Python 3.12)
+  # ------------------------------------------------------------------------------
+  # Built from Dockerfile.ai_agent (NOT in the douglara/woofedcrm image).
+  # Exposes the AgentOS API on :7777 and talks back to Rails at <FRONTEND_URL>/mcp.
+  # The model + api key are configured at runtime in Rails (Settings -> AI Assistant).
+  # ----------------------------------------------------------------------------
+  woofedcrm_ai_agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.ai_agent
+    depends_on:
+      - woofedcrm_postgres
+      - woofedcrm_web
+    environment:
+      # Public URL of the Rails app — the agent calls <FRONTEND_URL>/mcp
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+      # agno Postgres URL (psycopg). Same server as the app DB.
+      WOOFED_AI_DATABASE_URL: postgresql+psycopg://postgres:${POSTGRES_PASSWORD:-please-change-this-password}@woofedcrm_postgres:5432/woofed_ai_production
+      # Static bearer token every API caller must send (shared with Rails).
+      OS_SECURITY_KEY: ${OS_SECURITY_KEY:-please-change-me-to-a-long-random-secret}
+      PYTHONUNBUFFERED: "1"
+    networks:
+      - public_network
+    ports:
+      - "7777:7777"
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1024M
+
+volumes:
+  woofedcrm_pg_data:
+    external: false
+  woofedcrm_redis_data:
+    external: false
+
+networks:
+  public_network:
+    external: true
