@@ -1,70 +1,30 @@
 version: "3.7"
 
 # ==============================================================================
-# Woofed CRM - Portainer stack (with Traefik)
+# Woofed CRM - Portainer stack (Docker Swarm, uses an EXISTING Traefik)
 # ------------------------------------------------------------------------------
 # Image:   douglara/woofedcrm:latest  (Rails app, Sidekiq and GoodJob workers)
-# Network: public_network (external)
+# Network: network_public (external) — the same overlay network your Traefik uses
 #
-# PostgreSQL and Redis are NOT part of this stack — they are deployed separately.
-# Point the *_HOST / *_URL variables below at your existing Postgres and Redis.
+# Postgres + Redis + Traefik are deployed separately. This stack only registers
+# routing labels so your existing Traefik picks up the web service.
 #
-# The AI agent (agno / AgentOS) is NOT part of the douglara/woofedcrm image, so
-# it is built from this repository's Dockerfile.ai_agent. Deploy this stack from
-# the Git repository in Portainer so the build context resolves to the repo root.
+# Matched to your Traefik:
+#   - provider network : network_public
+#   - entrypoint       : websecure (HTTP -> HTTPS redirect handled by Traefik)
+#   - certresolver     : letsencryptresolver
 #
-# Routing is handled by Traefik (included below) via Docker provider labels.
-#
-# Before deploying:
-#   1. Create the external network (once):
-#        docker network create --driver overlay --attachable public_network
-#        (standalone / non-Swarm: docker network create public_network — and
-#         remove the deploy: blocks below, they are ignored outside Swarm)
-#   2. Set these environment variables in the Portainer stack UI:
-#        SECRET_KEY_BASE   -> openssl rand -hex 64
-#        OS_SECURITY_KEY   -> openssl rand -hex 32  (shared by app + AI agent)
-#        WOOFED_DOMAIN     -> public domain, e.g. crm.seudominio.com
-#        FRONTEND_URL      -> https://<WOOFED_DOMAIN>
-#        ACME_EMAIL        -> email for Let's Encrypt registration
-#        DATABASE_URL / REDIS_URL / WOOFED_AI_DATABASE_URL -> your external services
+# Portainer env vars to set:
+#   WOOFED_DOMAIN   -> crm.seudominio.com
+#   FRONTEND_URL    -> https://<WOOFED_DOMAIN>
+#   SECRET_KEY_BASE -> openssl rand -hex 64
+#   OS_SECURITY_KEY -> openssl rand -hex 32
+#   DATABASE_URL / REDIS_URL / WOOFED_AI_DATABASE_URL -> your external services
 # ==============================================================================
 
 services:
   # ----------------------------------------------------------------------------
-  # Traefik - reverse proxy / TLS termination (Let's Encrypt)
-  # ----------------------------------------------------------------------------
-  traefik:
-    image: traefik:v3.1
-    command:
-      - "--providers.docker=true"
-      - "--providers.docker.exposedbydefault=false"
-      - "--providers.docker.network=public_network"
-      - "--entrypoints.web.address=:80"
-      - "--entrypoints.websecure.address=:443"
-      # Redirect all HTTP traffic to HTTPS
-      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
-      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
-      # Let's Encrypt (HTTP-01 challenge)
-      - "--certificatesresolvers.letsencrypt.acme.httpchallenge=true"
-      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
-      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:-admin@example.com}"
-      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - traefik_letsencrypt:/letsencrypt
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks:
-      - public_network
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 256M
-
-  # ----------------------------------------------------------------------------
-  # Woofed CRM - Web application (Rails / Puma)
+  # Woofed CRM - Web application (Rails / Puma) — exposed via existing Traefik
   # ----------------------------------------------------------------------------
   woofedcrm_web:
     image: douglara/woofedcrm:latest
@@ -109,13 +69,14 @@ services:
       # SMTP_PASSWORD: your_password
       # MAILER_SENDER_EMAIL: WoofedCRM <hi@woofedcrm.com>
     networks:
-      - public_network
+      - network_public
     deploy:
       labels:
         - "traefik.enable=true"
+        - "traefik.docker.network=network_public"
         - "traefik.http.routers.woofedcrm.rule=Host(`${WOOFED_DOMAIN:-crm.seudominio.com}`)"
         - "traefik.http.routers.woofedcrm.entrypoints=websecure"
-        - "traefik.http.routers.woofedcrm.tls.certresolver=letsencrypt"
+        - "traefik.http.routers.woofedcrm.tls.certresolver=letsencryptresolver"
         - "traefik.http.services.woofedcrm.loadbalancer.server.port=80"
       resources:
         limits:
@@ -139,7 +100,7 @@ services:
       LANGUAGE: pt-BR
       DEFAULT_TIMEZONE: Brasilia
     networks:
-      - public_network
+      - network_public
     deploy:
       resources:
         limits:
@@ -164,7 +125,7 @@ services:
       LANGUAGE: pt-BR
       DEFAULT_TIMEZONE: Brasilia
     networks:
-      - public_network
+      - network_public
     deploy:
       resources:
         limits:
@@ -174,13 +135,15 @@ services:
   # ----------------------------------------------------------------------------
   # Woofed CRM - AI agent (agno / AgentOS, Python 3.12)
   # ------------------------------------------------------------------------------
-  # Built from Dockerfile.ai_agent (NOT in the douglara/woofedcrm image).
-  # Exposes the AgentOS API on :7777 and talks back to Rails at <FRONTEND_URL>/mcp.
-  # The model + api key are configured at runtime in Rails (Settings -> AI Assistant).
-  # Internal-only by default (no Traefik router). Uncomment the labels below to
-  # publish it at agent.<domain> if you need external access to the AgentOS API.
+  # NOTE: Docker Swarm does NOT build images from a Dockerfile. To run this in
+  # Swarm, publish the image first and replace `build:` with `image:`:
+  #   docker build -f Dockerfile.ai_agent -t YOUR_REGISTRY/woofed-agent:latest .
+  #   docker push YOUR_REGISTRY/woofed-agent:latest
+  #
+  # Internal-only by default. Uncomment the labels to publish at agent.<domain>.
   # ----------------------------------------------------------------------------
   woofedcrm_ai_agent:
+    # image: YOUR_REGISTRY/woofed-agent:latest
     build:
       context: .
       dockerfile: Dockerfile.ai_agent
@@ -195,23 +158,21 @@ services:
       OS_SECURITY_KEY: ${OS_SECURITY_KEY:-please-change-me-to-a-long-random-secret}
       PYTHONUNBUFFERED: "1"
     networks:
-      - public_network
+      - network_public
     deploy:
       # labels:
       #   - "traefik.enable=true"
+      #   - "traefik.docker.network=network_public"
       #   - "traefik.http.routers.woofedagent.rule=Host(`agent.${WOOFED_DOMAIN:-seudominio.com}`)"
       #   - "traefik.http.routers.woofedagent.entrypoints=websecure"
-      #   - "traefik.http.routers.woofedagent.tls.certresolver=letsencrypt"
+      #   - "traefik.http.routers.woofedagent.tls.certresolver=letsencryptresolver"
       #   - "traefik.http.services.woofedagent.loadbalancer.server.port=7777"
       resources:
         limits:
           cpus: "1"
           memory: 1024M
 
-volumes:
-  traefik_letsencrypt:
-    external: false
-
 networks:
-  public_network:
+  network_public:
     external: true
+    name: network_public
