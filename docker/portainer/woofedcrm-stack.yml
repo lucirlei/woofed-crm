@@ -1,15 +1,19 @@
 version: "3.7"
 
 # ==============================================================================
-# Woofed CRM - Portainer stack
+# Woofed CRM - Portainer stack (with Traefik)
 # ------------------------------------------------------------------------------
 # Image:   douglara/woofedcrm:latest  (Rails app, Sidekiq and GoodJob workers)
 # Network: public_network (external)
 #
+# PostgreSQL and Redis are NOT part of this stack — they are deployed separately.
+# Point the *_HOST / *_URL variables below at your existing Postgres and Redis.
+#
 # The AI agent (agno / AgentOS) is NOT part of the douglara/woofedcrm image, so
-# it is built from this repository's Dockerfile.ai_agent. If you deploy this
-# stack from a Git repository in Portainer, the build context resolves to the
-# repo root automatically.
+# it is built from this repository's Dockerfile.ai_agent. Deploy this stack from
+# the Git repository in Portainer so the build context resolves to the repo root.
+#
+# Routing is handled by Traefik (included below) via Docker provider labels.
 #
 # Before deploying:
 #   1. Create the external network (once):
@@ -19,50 +23,40 @@ version: "3.7"
 #   2. Set these environment variables in the Portainer stack UI:
 #        SECRET_KEY_BASE   -> openssl rand -hex 64
 #        OS_SECURITY_KEY   -> openssl rand -hex 32  (shared by app + AI agent)
-#        POSTGRES_PASSWORD -> a strong password
-#        FRONTEND_URL      -> your public URL, e.g. https://crm.seudominio.com
+#        WOOFED_DOMAIN     -> public domain, e.g. crm.seudominio.com
+#        FRONTEND_URL      -> https://<WOOFED_DOMAIN>
+#        ACME_EMAIL        -> email for Let's Encrypt registration
+#        DATABASE_URL / REDIS_URL / WOOFED_AI_DATABASE_URL -> your external services
 # ==============================================================================
 
 services:
   # ----------------------------------------------------------------------------
-  # PostgreSQL with pgvector (required — the app uses vector embeddings for AI)
+  # Traefik - reverse proxy / TLS termination (Let's Encrypt)
   # ----------------------------------------------------------------------------
-  woofedcrm_postgres:
-    image: pgvector/pgvector:pg16
+  traefik:
+    image: traefik:v3.1
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=public_network"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      # Redirect all HTTP traffic to HTTPS
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      # Let's Encrypt (HTTP-01 challenge)
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:-admin@example.com}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
     volumes:
-      - woofedcrm_pg_data:/var/lib/postgresql/data
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-please-change-this-password}
-      POSTGRES_DB: woofed_crm_production
+      - traefik_letsencrypt:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - public_network
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    deploy:
-      resources:
-        limits:
-          cpus: "1"
-          memory: 1024M
-
-  # ----------------------------------------------------------------------------
-  # Redis (used by Sidekiq / ActionCable / cache)
-  # ----------------------------------------------------------------------------
-  woofedcrm_redis:
-    image: redis:6.2.7-alpine
-    command: redis-server --appendonly yes
-    volumes:
-      - woofedcrm_redis_data:/data
-    networks:
-      - public_network
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
     deploy:
       resources:
         limits:
@@ -77,9 +71,6 @@ services:
     command: >
       bash -c "bundle exec rails db:create db:migrate db:seed --trace &&
                bundle exec puma -C config/puma.rb"
-    depends_on:
-      - woofedcrm_postgres
-      - woofedcrm_redis
     environment:
       RAILS_ENV: production
       RAILS_SERVE_STATIC_FILES: "true"
@@ -87,9 +78,10 @@ services:
       PORT: "80"
       # ---- Required secrets (CHANGE THESE) -----------------------------------
       SECRET_KEY_BASE: ${SECRET_KEY_BASE:-please-change-this-to-a-long-random-string}
-      # ---- Database / Redis --------------------------------------------------
-      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-please-change-this-password}@woofedcrm_postgres:5432/woofed_crm_production
-      REDIS_URL: redis://woofedcrm_redis:6379/0
+      # ---- External Database / Redis (deployed separately) -------------------
+      # Use a pgvector-enabled Postgres — the app stores vector embeddings.
+      DATABASE_URL: ${DATABASE_URL:-postgres://postgres:password@postgres:5432/woofed_crm_production}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       GOOD_JOB_EXECUTION_MODE: external
       # ---- AI agent integration ----------------------------------------------
       # OS_SECURITY_KEY is the shared bearer token between Rails and the agent.
@@ -98,7 +90,7 @@ services:
       # ---- Application config -------------------------------------------------
       LANGUAGE: pt-BR
       DEFAULT_TIMEZONE: Brasilia
-      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+      FRONTEND_URL: ${FRONTEND_URL:-https://crm.seudominio.com}
       ENABLE_USER_SIGNUP: "false"
       STORE_URL: https://store.woofedcrm.com
       # ---- Admin (Motor Admin) -----------------------------------------------
@@ -118,9 +110,13 @@ services:
       # MAILER_SENDER_EMAIL: WoofedCRM <hi@woofedcrm.com>
     networks:
       - public_network
-    ports:
-      - "3000:80"
     deploy:
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.woofedcrm.rule=Host(`${WOOFED_DOMAIN:-crm.seudominio.com}`)"
+        - "traefik.http.routers.woofedcrm.entrypoints=websecure"
+        - "traefik.http.routers.woofedcrm.tls.certresolver=letsencrypt"
+        - "traefik.http.services.woofedcrm.loadbalancer.server.port=80"
       resources:
         limits:
           cpus: "1"
@@ -133,15 +129,13 @@ services:
     image: douglara/woofedcrm:latest
     command: bundle exec sidekiq -C config/sidekiq.yml
     depends_on:
-      - woofedcrm_postgres
-      - woofedcrm_redis
       - woofedcrm_web
     environment:
       RAILS_ENV: production
       RAILS_LOG_TO_STDOUT: "true"
       SECRET_KEY_BASE: ${SECRET_KEY_BASE:-please-change-this-to-a-long-random-string}
-      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-please-change-this-password}@woofedcrm_postgres:5432/woofed_crm_production
-      REDIS_URL: redis://woofedcrm_redis:6379/0
+      DATABASE_URL: ${DATABASE_URL:-postgres://postgres:password@postgres:5432/woofed_crm_production}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       LANGUAGE: pt-BR
       DEFAULT_TIMEZONE: Brasilia
     networks:
@@ -159,15 +153,13 @@ services:
     image: douglara/woofedcrm:latest
     command: bundle exec good_job
     depends_on:
-      - woofedcrm_postgres
-      - woofedcrm_redis
       - woofedcrm_web
     environment:
       RAILS_ENV: production
       RAILS_LOG_TO_STDOUT: "true"
       SECRET_KEY_BASE: ${SECRET_KEY_BASE:-please-change-this-to-a-long-random-string}
-      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-please-change-this-password}@woofedcrm_postgres:5432/woofed_crm_production
-      REDIS_URL: redis://woofedcrm_redis:6379/0
+      DATABASE_URL: ${DATABASE_URL:-postgres://postgres:password@postgres:5432/woofed_crm_production}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       GOOD_JOB_EXECUTION_MODE: external
       LANGUAGE: pt-BR
       DEFAULT_TIMEZONE: Brasilia
@@ -185,36 +177,39 @@ services:
   # Built from Dockerfile.ai_agent (NOT in the douglara/woofedcrm image).
   # Exposes the AgentOS API on :7777 and talks back to Rails at <FRONTEND_URL>/mcp.
   # The model + api key are configured at runtime in Rails (Settings -> AI Assistant).
+  # Internal-only by default (no Traefik router). Uncomment the labels below to
+  # publish it at agent.<domain> if you need external access to the AgentOS API.
   # ----------------------------------------------------------------------------
   woofedcrm_ai_agent:
     build:
       context: .
       dockerfile: Dockerfile.ai_agent
     depends_on:
-      - woofedcrm_postgres
       - woofedcrm_web
     environment:
       # Public URL of the Rails app — the agent calls <FRONTEND_URL>/mcp
-      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
-      # agno Postgres URL (psycopg). Same server as the app DB.
-      WOOFED_AI_DATABASE_URL: postgresql+psycopg://postgres:${POSTGRES_PASSWORD:-please-change-this-password}@woofedcrm_postgres:5432/woofed_ai_production
+      FRONTEND_URL: ${FRONTEND_URL:-https://crm.seudominio.com}
+      # agno Postgres URL (psycopg) — external Postgres, deployed separately.
+      WOOFED_AI_DATABASE_URL: ${WOOFED_AI_DATABASE_URL:-postgresql+psycopg://postgres:password@postgres:5432/woofed_ai_production}
       # Static bearer token every API caller must send (shared with Rails).
       OS_SECURITY_KEY: ${OS_SECURITY_KEY:-please-change-me-to-a-long-random-secret}
       PYTHONUNBUFFERED: "1"
     networks:
       - public_network
-    ports:
-      - "7777:7777"
     deploy:
+      # labels:
+      #   - "traefik.enable=true"
+      #   - "traefik.http.routers.woofedagent.rule=Host(`agent.${WOOFED_DOMAIN:-seudominio.com}`)"
+      #   - "traefik.http.routers.woofedagent.entrypoints=websecure"
+      #   - "traefik.http.routers.woofedagent.tls.certresolver=letsencrypt"
+      #   - "traefik.http.services.woofedagent.loadbalancer.server.port=7777"
       resources:
         limits:
           cpus: "1"
           memory: 1024M
 
 volumes:
-  woofedcrm_pg_data:
-    external: false
-  woofedcrm_redis_data:
+  traefik_letsencrypt:
     external: false
 
 networks:
